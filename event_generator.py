@@ -19,6 +19,7 @@ class Event:
         self.diff_prev_time = None
         self.roc = None
         self.cgm_predicted=None
+        self.alarm_delay=None
         self.alarm_hypo=None
         self.alarm_out_of_range=None
 
@@ -37,6 +38,8 @@ class Event:
 
     def set_cgm_predicted(self):
         self.cgm_predicted= self.cgm + self.roc * 30
+    def set_alarm_delay(self):
+        self.alarm_delay= self.diff_prev_time >20
 
     def set_alarm_hypo(self):
         self.alarm_hypo = (self.cgm < 70 or self.cgm_predicted < 70)
@@ -59,6 +62,7 @@ class Event:
             "roc": self.roc,
             "diff_prev_time": self.diff_prev_time,
             "cgm_predicted": self.cgm_predicted,
+            "alarm_delay": self.alarm_delay,
             "alarm_hypo": bool(self.alarm_hypo),
             "alarm_out_of_range": bool(self.alarm_out_of_range)
 
@@ -80,12 +84,14 @@ class ExecutionTrace:
             event.set_diff_prev_time(self.events[-1])
             event.set_roc(self._times, self._glucoses, i)
             event.set_cgm_predicted()
+            event.set_alarm_delay()
             event.set_alarm_hypo()
             event.set_alarm_out_of_range(self.low, self.high)
         else:
             event.diff_prev_time= 0.0
             event.roc=0.0
             event.cgm_predicted=event.cgm
+            event.alarm_delay=False
             event.alarm_hypo=event.cgm<70
             event.alarm_out_of_range= (event.cgm< low or event.cgm > high)
         self.events.append(event)
