@@ -4,48 +4,52 @@ import argparse
 import numpy as np
 from datetime import datetime
 
+
+
 class Event:
-    def __init__(self, timestamp, time_min, cgm, cho, insulin, lbgi, hbgi, risk):
+    def __init__(self, timestamp, time_min, bg, cgm, cho, insulin, roc, cgm_predicted, lbgi, hbgi, risk):
         self.timestamp = timestamp
         self.time_min = time_min
+        self.bg =bg
         self.cgm = cgm
         self.cho = cho
+        self.roc = roc 
+        self.cgm_predicted = cgm_predicted
         self.insulin = insulin
         self.lbgi = lbgi
         self.hbgi = hbgi
         self.risk = risk
 
         #dati derivati
-        self.diff_prev_time = None
-        self.roc = None
-        self.cgm_predicted=None
+        self.lgs_active= None #timer per la sospensione dell'insulina
         self.alarm_delay=None
         self.alarm_hypo=None
         self.alarm_out_of_range=None
+        self.real_roc= None
 
-    def set_diff_prev_time(self, prev_event):
-        self.diff_prev_time= self.time_min - prev_event.time_min
-
-    def set_roc(self, times, glucoses, i):
-        start = max(0, i - 4)
-        t = times[start:i]
-        g = glucoses[start:i]
-        if len(t) < 2:
-            self.roc=0.0
-            return
-        coeffs = np.polyfit(t, g, 1)
-        self.roc = coeffs[0]
-
-    def set_cgm_predicted(self):
-        self.cgm_predicted= self.cgm + self.roc * 30
-    def set_alarm_delay(self):
-        self.alarm_delay= self.diff_prev_time >20
+    def set_lgs_active(self, lgs):
+        self.lgs_active = lgs
+        
+    def set_alarm_delay(self, prev_event):
+        self.alarm_delay= self.time_min - prev_event.time_min >20
 
     def set_alarm_hypo(self):
         self.alarm_hypo = (self.cgm < 70 or self.cgm_predicted < 70)
     
     def set_alarm_out_of_range(self, low, high):
         self.alarm_out_of_range= (self.cgm < low  or self.cgm > high)
+    
+    def calc_real_roc(self, bg_history, sample_time):
+        history = bg_history[-4:]  
+        n = len(history)
+        if n < 2:
+            self.real_roc = 0.0
+            return
+        
+        times = np.array([i * sample_time for i in range(n)])
+        values = np.array(history)
+        self.real_roc = round(np.polyfit(times, values, 1)[0], 6)
+        
 
     
 
@@ -53,18 +57,23 @@ class Event:
         return {
             "timestamp": str(self.timestamp),
             "time_min": self.time_min,
+            "bg": self.bg,
             "cgm": self.cgm,
             "cho": self.cho,
             "insulin": self.insulin,
+            "roc": self.roc,
+            "cgm_predicted": self.cgm_predicted,
+
             "lbgi": self.lbgi,
             "hbgi": self.hbgi,
             "risk": self.risk,
-            "roc": self.roc,
-            "diff_prev_time": self.diff_prev_time,
-            "cgm_predicted": self.cgm_predicted,
+            
+            "lgs_active": self.lgs_active,
+
             "alarm_delay": self.alarm_delay,
             "alarm_hypo": bool(self.alarm_hypo),
-            "alarm_out_of_range": bool(self.alarm_out_of_range)
+            "alarm_out_of_range": bool(self.alarm_out_of_range),
+            "real_roc": self.real_roc
 
         }
 
@@ -74,29 +83,42 @@ class ExecutionTrace:
         self.events = []
         self.low = low
         self.high=high
-        self._times=[]
-        self._glucoses=[]
+        self._lgs_timer=0
 
 
-    def add_event(self, event, low, high):
+    def add_event(self, event, low, high, sample_time):
+        bg_history = [e.bg for e in self.events]
+        bg_history.append(event.bg)
+        event.calc_real_roc(bg_history, sample_time)
+
         if self.events:
             i = len(self.events)
-            event.set_diff_prev_time(self.events[-1])
-            event.set_roc(self._times, self._glucoses, i)
-            event.set_cgm_predicted()
-            event.set_alarm_delay()
+            event.set_alarm_delay(self.events[-1])
             event.set_alarm_hypo()
             event.set_alarm_out_of_range(self.low, self.high)
         else:
-            event.diff_prev_time= 0.0
-            event.roc=0.0
-            event.cgm_predicted=event.cgm
             event.alarm_delay=False
             event.alarm_hypo=event.cgm<70
             event.alarm_out_of_range= (event.cgm< low or event.cgm > high)
+
+            
+
+        if event.cgm < 105.0 and event.cgm_predicted < 85.0:
+            if self._lgs_timer <= 0:                
+                self._lgs_timer=120 
+                
+        if self._lgs_timer > 0: 
+            if event.cgm >= 105.0 and event.cgm_predicted >= 85:
+                self._lgs_timer = 0
+            else:
+                self._lgs_timer -= sample_time
+        if self._lgs_timer < 0:
+            self._lgs_timer = 0
+
+        active = self._lgs_timer > 0
+        event.set_lgs_active(active)
+        
         self.events.append(event)
-        self._times.append(event.time_min)
-        self._glucoses.append(event.cgm)
     
     def convert_json(self, filepath):
         with open(filepath, 'w') as f:
@@ -108,6 +130,9 @@ def main():
     parser.add_argument('filename')
     parser.add_argument('--low', type=float, default=70.0)
     parser.add_argument('--high', type=float, default=180.0)
+    parser.add_argument('--time', type=int, default=5)
+    parser.add_argument('--output',  default='eventi')
+
 
     args = parser.parse_args()
 
@@ -125,17 +150,20 @@ def main():
             event=Event(
                 timestamp=t,
                 time_min=time_min,
+                bg = float(row["BG"]),
                 cgm=float(row["CGM"]),
                 cho=float(row["CHO"]),
                 insulin=float(row["insulin"]),
+                roc=float(row["roc"]),
+                cgm_predicted=float(row["cgm_predicted"]),
                 lbgi=float(row["LBGI"]),
                 hbgi=float(row["HBGI"]),
                 risk=float(row["Risk"])
             )
 
-            trace.add_event(event, args.low, args.high)
+            trace.add_event(event, args.low, args.high, args.time)
 
-    trace.convert_json('eventi.json')
+    trace.convert_json(f'{args.output}.json')
 
 
 if __name__ == '__main__':
